@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Embed Python (URL-coded starter) — with Save/Load/Font/Resizer</title>
+
+  <!-- CodeMirror CSS -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.css" />
+  <style>
+    html,body { height:100%; margin:0; font-family:system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+    .container { display:flex; height:100vh; box-sizing:border-box; padding:6px; }
+    .panel { flex:1 1 100%; display:flex; flex-direction:column; padding:6px; box-sizing:border-box; min-width:360px; }
+    .header { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+    .spacer { flex:1; }
+    button { padding:6px 10px; cursor:pointer; }
+    select { padding:6px; }
+    /* Editor + splitter + output stacked vertically */
+    .stack { display:flex; flex-direction:column; flex:1 1 auto; min-height:0; border:1px solid #ddd; border-radius:6px; overflow:hidden; }
+    .editor-area { flex-basis:50%; flex-grow:0; flex-shrink:0; min-height:80px; box-sizing:border-box; overflow:hidden; }
+    .splitter { height:8px; background:#f0f0f0; cursor:row-resize; display:flex; align-items:center; justify-content:center; }
+    .splitter:after { content:""; width:36px; height:4px; background:#ccc; border-radius:2px; }
+    .output-area { flex-basis:50%; flex-grow:0; flex-shrink:0; min-height:80px; box-sizing:border-box; background:#0b0b0b; color:#b6f39b; padding:8px; white-space:pre-wrap; overflow:auto; resize:none; }
+    .CodeMirror { height:100% !important; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", "Courier New", monospace; }
+    .controls { display:flex; gap:8px; align-items:center; }
+    .note { font-size:12px; color:#666; margin-left:8px; }
+    @media (max-width:900px) { .container { flex-direction:column; } .panel { padding:4px; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="panel">
+      <div class="header" role="toolbar" aria-label="Editor controls">
+        <h3 style="margin:0;">Python Editor</h3>
+        <div class="spacer"></div>
+
+        <!-- Teacher controls (visible only when not embedded) -->
+        <div id="teacher-controls" class="controls" aria-hidden="false">
+          <button id="copyIframe">Copy embed iframe</button>
+          <button id="copyDirect">Copy direct URL</button>
+        </div>
+
+        <!-- Student/instructor controls -->
+        <div class="controls" style="margin-left:8px;">
+          <label for="fontSizeSelect" style="font-size:13px;">Font:</label>
+          <select id="fontSizeSelect" title="Editor & terminal font size">
+            <option value="14">Medium</option>
+            <option value="12">Small</option>
+            <option value="16">Large</option>
+          </select>
+
+          <input id="fileInput" type="file" accept=".py" style="display:none;">
+          <button id="loadBtn" title="Load .py file">Load</button>
+          <button id="saveBtn" title="Download code as .py">Save</button>
+
+          <button id="runBtn" style="margin-left:6px;">Run ▶</button>
+          <button id="resetBtn" title="Reset to initial code" style="margin-left:6px;">Reset</button>
+        </div>
+      </div>
+
+      <div class="stack" id="stack">
+        <div class="editor-area" id="editor-area">
+          <textarea id="code" style="display:none;">
+# default starter template
+def greet(name):
+    return f"Hello, {name}!"
+
+for n in ["Alice","Bob","Student"]:
+    print(greet(n))
+          </textarea>
+        </div>
+
+        <div class="splitter" id="splitter" role="separator" aria-orientation="vertical" aria-label="Resize code and terminal"></div>
+
+        <pre id="output" class="output-area" aria-live="polite">Python ready.</pre>
+      </div>
+
+      <div style="height:6px;"></div>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <div class="note">Runtime: Pyodide (client-side)</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- libs -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/mode/python/python.min.js"></script>
+
+  <script>
+    // dynamic load of pyodide
+    (function () {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/pyodide/v0.23.4/full/pyodide.js';
+      s.onload = initPyodide;
+      document.head.appendChild(s);
+    })();
+
+    // ---------- helpers ----------
+    function b64EncodeUnicode(str) {
+      return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, function(match,p1){ return String.fromCharCode('0x' + p1); }));
+    }
+    function b64DecodeUnicode(str) {
+      return decodeURIComponent(Array.prototype.map.call(atob(str), function(c){ return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2); }).join(''));
+    }
+    function readCodeFromFragment() {
+      const hash = location.hash || '';
+      if (!hash) return null;
+      const m = hash.match(/(?:#|&)?code=([^&]+)/);
+      if (m && m[1]) {
+        try { return b64DecodeUnicode(decodeURIComponent(m[1])); } catch (e) { console.warn('decode fail', e); }
+      }
+      return null;
+    }
+
+    // ---------- state ----------
+    let pyodide = null;
+    let editor = null;
+    const templateNode = document.getElementById('code');
+    const defaultTemplate = templateNode.textContent.trim();
+    let initialCode = defaultTemplate; // frame-specific initial code
+
+    async function initPyodide() {
+      const out = document.getElementById('output');
+      out.textContent = 'Python ready.'; // start with ready message
+      try {
+        pyodide = await loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.23.4/full/' });
+        // pyodide ready; keep terminal message as Python ready.
+      } catch (e) {
+        out.textContent = 'Failed to load Pyodide: ' + e;
+        console.error(e);
+      }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      // CodeMirror init
+      editor = CodeMirror.fromTextArea(templateNode, {
+        mode: 'python', lineNumbers: true, indentUnit: 4, tabSize: 4
+      });
+
+      // editor wrapper fills editor-area
+      const edWrapper = editor.getWrapperElement();
+      edWrapper.style.height = '100%';
+
+      // initial code from fragment if present
+      const fragCode = readCodeFromFragment();
+      if (fragCode) {
+        editor.setValue(fragCode);
+        initialCode = fragCode;
+      } else {
+        editor.setValue(defaultTemplate);
+        initialCode = defaultTemplate;
+      }
+
+      // hide teacher controls when embedded in an iframe
+      const teacherControls = document.getElementById('teacher-controls');
+      try {
+        if (window.self !== window.top) {
+          teacherControls.style.display = 'none';
+          teacherControls.setAttribute('aria-hidden','true');
+        }
+      } catch(e) {
+        teacherControls.style.display = 'none';
+        teacherControls.setAttribute('aria-hidden','true');
+      }
+
+      // wire up buttons
+      document.getElementById('runBtn').addEventListener('click', runCode);
+      document.getElementById('resetBtn').addEventListener('click', () => {
+        editor.setValue(initialCode);
+        const out = document.getElementById('output');
+        out.textContent = 'Code reset.\nPython ready.';
+        editor.refresh && editor.refresh();
+      });
+
+      // copy (teacher) buttons
+      document.getElementById('copyIframe').addEventListener('click', copyIframeSnippet);
+      document.getElementById('copyDirect').addEventListener('click', copyDirectURL);
+
+      // Save / Load
+      document.getElementById('saveBtn').addEventListener('click', saveFile);
+      const fileInput = document.getElementById('fileInput');
+      document.getElementById('loadBtn').addEventListener('click', ()=> fileInput.click());
+      fileInput.addEventListener('change', handleFileLoad);
+
+      // font size dropdown
+      const fontSelect = document.getElementById('fontSizeSelect');
+      // default Medium (14) selected by value; apply now
+      applyFontSize(fontSelect.value);
+      fontSelect.addEventListener('change', (e) => applyFontSize(e.target.value));
+
+      // splitter behaviour (drag to resize)
+      const splitter = document.getElementById('splitter');
+      const editorArea = document.getElementById('editor-area');
+      const output = document.getElementById('output');
+      let dragging = false;
+      let startY = 0;
+      let startEditorHeight = 0;
+      let stack = document.getElementById('stack');
+
+      splitter.addEventListener('mousedown', (e) => {
+        dragging = true;
+        startY = e.clientY;
+        const rect = editorArea.getBoundingClientRect();
+        startEditorHeight = rect.height;
+        document.body.style.cursor = 'row-resize';
+        e.preventDefault();
+      });
+      window.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        const delta = e.clientY - startY;
+        const stackRect = stack.getBoundingClientRect();
+        let newEditorHeight = startEditorHeight + delta;
+        // clamp min/max
+        const min = 60;
+        const max = stackRect.height - 60;
+        newEditorHeight = Math.max(min, Math.min(max, newEditorHeight));
+        // set flex-basis for editor and output
+        const editorPercent = (newEditorHeight / stackRect.height) * 100;
+        editorArea.style.flexBasis = editorPercent + '%';
+        output.style.flexBasis = (100 - editorPercent) + '%';
+        editor.refresh && editor.refresh();
+      });
+      window.addEventListener('mouseup', () => {
+        if (dragging) {
+          dragging = false;
+          document.body.style.cursor = '';
+        }
+      });
+      // touch support
+      splitter.addEventListener('touchstart', (e) => {
+        dragging = true;
+        startY = e.touches[0].clientY;
+        const rect = editorArea.getBoundingClientRect();
+        startEditorHeight = rect.height;
+        e.preventDefault();
+      }, {passive:false});
+      window.addEventListener('touchmove', (e) => {
+        if (!dragging) return;
+        const delta = e.touches[0].clientY - startY;
+        const stackRect = stack.getBoundingClientRect();
+        let newEditorHeight = startEditorHeight + delta;
+        const min = 60;
+        const max = stackRect.height - 60;
+        newEditorHeight = Math.max(min, Math.min(max, newEditorHeight));
+        const editorPercent = (newEditorHeight / stackRect.height) * 100;
+        editorArea.style.flexBasis = editorPercent + '%';
+        output.style.flexBasis = (100 - editorPercent) + '%';
+        editor.refresh && editor.refresh();
+      }, {passive:false});
+      window.addEventListener('touchend', () => {
+        dragging = false;
+      });
+
+      // refresh after window resize to keep editor layout
+      window.addEventListener('resize', ()=> editor.refresh && editor.refresh());
+    });
+
+    // capture python stdout/stderr to JS
+    window.writeOutputLine = function(s) {
+      const out = document.getElementById('output');
+      out.textContent += s;
+      out.scrollTop = out.scrollHeight;
+    };
+
+    async function runCode() {
+      if (!pyodide) {
+        const out = document.getElementById('output');
+        out.textContent = 'Python ready.'; // ensure message if runtime missing
+        return;
+      }
+      const code = editor.getValue();
+      const out = document.getElementById('output');
+      out.textContent = ''; // clear before run
+      try {
+        await pyodide.runPythonAsync(`
+import sys, js
+class _Writer:
+    def write(self, x):
+        if x:
+            js.writeOutputLine(x)
+    def flush(self): pass
+sys.stdout = _Writer()
+sys.stderr = _Writer()
+`);
+        await pyodide.runPythonAsync(code);
+      } catch (err) {
+        out.textContent += '\\nError:\\n' + err;
+        console.error(err);
+      }
+    }
+
+    // ---------- save / load ----------
+    function saveFile() {
+      const code = editor.getValue();
+      const blob = new Blob([code], { type: 'text/x-python' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'code.py';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function handleFileLoad(evt) {
+      const f = evt.target.files[0];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const contents = e.target.result;
+        editor.setValue(contents);
+        editor.refresh && editor.refresh();
+        // clear file input for next time
+        evt.target.value = '';
+        document.getElementById('output').textContent = 'Loaded file into editor.\nPython ready.';
+      };
+      reader.readAsText(f);
+    }
+
+    // ---------- teacher helpers (copy iframe/URL with fragment) ----------
+    function makeFragmentForCode(text) {
+      const b64 = b64EncodeUnicode(text);
+      return '#code=' + encodeURIComponent(b64);
+    }
+    function copyToClipboard(text) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(()=> alert('Copied to clipboard'));
+      } else {
+        prompt('Copy the text below', text);
+      }
+    }
+    function copyIframeSnippet() {
+      const code = editor.getValue();
+      const frag = makeFragmentForCode(code);
+      const src = location.origin + location.pathname + frag;
+      const iframe = `<iframe src="${src}" width="100%" height="720" frameborder="0" title="Embedded Python"></iframe>`;
+      copyToClipboard(iframe);
+    }
+    function copyDirectURL() {
+      const code = editor.getValue();
+      const frag = makeFragmentForCode(code);
+      const src = location.origin + location.pathname + frag;
+      copyToClipboard(src);
+    }
+
+    // ---------- font size handling ----------
+    function applyFontSize(sizePx) {
+      // apply to CodeMirror wrapper and terminal
+      const edWrap = editor.getWrapperElement();
+      edWrap.style.fontSize = sizePx + 'px';
+      editor.refresh && editor.refresh();
+      const out = document.getElementById('output');
+      out.style.fontSize = sizePx + 'px';
+    }
+  </script>
+</body>
+</html>
